@@ -2,3 +2,4 @@ NODE_NAME=SmartCitizenRTX4100
 NODE=Projects\Amelie\COLApps\Apps\SmartCitizenRTX4100 
 C-FILES=
   Main.c
+  rtx_AppDns.c

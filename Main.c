@@ -27,7 +27,7 @@
 //#define USE_LUART_TERMINAL
 
 // Decomment to activate normal operation using SPI
-#define SPI_COMMUNICATION
+//#define SPI_COMMUNICATION
 
 #include <string.h>
 #include <stdio.h>
@@ -35,7 +35,7 @@
 #include <stdlib.h>
 
 #include <Core/RtxCore.h>
-#include <Ros/RosCfg.h>
+#include <ROS/RosCfg.h>
 #include <PortDef.h>
 #include <Api/Api.h>
 #include <Cola/Cola.h>
@@ -46,7 +46,7 @@
 #include <PtApps/AppCommon.h>
 #include <PtApps/AppLed.h>
 #include <PtApps/AppSocket.h>
-#include <PtApps/AppWifi.h>
+#include <PtApps/AppWiFi.h>
 
 
 #ifdef USE_LUART_TERMINAL
@@ -57,7 +57,26 @@
 #include <Drivers/DrvSpi.h>
 #endif
 
-
+/*TEST JORDI*/
+#include <../Projects/Amelie/COLApps/Apps/SmartCitizenRTX4100/rtx_AppDns.h>
+//#include <../Projects/Amelie/COLApps/Apps/SmartCitizenRTX4100/rtx_AppWeb.h>
+#include <RtxEai/RtxEai.h>
+#include <Drivers/DrvSpiSlave.h>
+// For debug (EAI)
+#define printf(...) RtxEaiPrintf(ColaIf->ColaTaskId,__VA_ARGS__)
+// Data for configure softAP
+#define SOFT_AP_ESSID           "SCK_AP_" //partial essid
+#define SOFT_AP_SECURITY_TYPE   AWST_NONE
+#define SOFT_AP_COUNTRY_CODE    "ES"
+#define SOFT_AP_CHANNEL         2437 //Channel 6 center frequency
+#define SOFT_AP_INACT           10 // minutes
+#define SOFT_AP_BEACON          100 // ms
+#define STATIC_IP               "192.168.1.99"
+#define SUBNET_MASK             "255.255.255.0"
+// PtEntry for softap apps (dns & webserver)
+static PtEntryType* Pt_AppDnsd;
+static PtEntryType* Pt_AppWebd;
+/*TEST JORDI*/
 
 /****************************************************************************
 *                              Macro definitions
@@ -89,7 +108,7 @@ typedef struct {
   rsuint8 use_dhcp;
   ApiSocketAddrType static_address, static_subnet, static_gateway;
 } AppDataType;
-
+    
 
 /****************************************************************************
 *                            Global variables/const
@@ -136,7 +155,6 @@ char *argv[MAX_ARGV];
 // TCP send/receive/ buffers
 rsuint8 tx_buffer[TX_BUFFER_LENGTH];
 rsuint8 rx_buffer[TX_BUFFER_LENGTH];
-
 
 /****************************************************************************
 *                                Implementation
@@ -488,6 +506,7 @@ static PT_THREAD(PtWifi_suspend(struct pt *Pt, const RosMailType *Mail)) {
   SendApiWifiSuspendReq(COLA_TASK, 10*60*1000); // ms
   PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_WIFI_SUSPEND_CFM));
   POWER_TEST_PIN_TOGGLE;
+  void EMU_EnterEM2();
   EMU_EnterEM2(); // uC enter suspend, too. Use an external interrupt to wake up!
   PT_END(Pt);
 }
@@ -929,6 +948,85 @@ static PT_THREAD(PtWifi_TCP_start(struct pt *Pt, const RosMailType *Mail, ApiSoc
   PT_END(Pt);
 }
 
+
+/**
+ * @brief Sets the softAP mode
+ * @param Pt : current protothread pointer
+ * @param Mail : protothread mail
+ **/
+static PT_THREAD(PtWifi_softAP(struct pt *Pt, const RosMailType *Mail)) {
+    static struct pt childPt;
+    PT_BEGIN(Pt);
+    
+    PT_SPAWN(Pt, &childPt, PtAppWifiReset(&childPt, Mail));
+    
+    //SSID = MASK + MAC
+    const ApiWifiMacAddrType *pMacAddr = AppWifiGetMacAddr();
+    
+    rsuint8 essid[32];
+    snprintf((char*)essid, sizeof(essid), "%s%02X%02X%02X", 
+            SOFT_AP_ESSID, (*pMacAddr)[3], (*pMacAddr)[4], (*pMacAddr)[5]);
+    AppWifiApSetSoftApInfo((rsuint8*)essid, SOFT_AP_SECURITY_TYPE, 
+            FALSE, 0, NULL, SOFT_AP_CHANNEL, SOFT_AP_INACT, 
+            (rsuint8*)SOFT_AP_COUNTRY_CODE, SOFT_AP_BEACON);
+    
+    //Start SoftAP
+    PT_SPAWN(Pt, &childPt, PtAppWifiStartSoftAp(&childPt, Mail));
+//printf ("AP (ESSID:%s) -> OK\n", essid);
+    
+    //static IP
+    ApiIpV4AddressType address, subnetMask;
+    inet_aton(STATIC_IP, &address);
+    inet_aton(SUBNET_MASK, &subnetMask);
+    AppWifiIpv4Config(true,address,subnetMask,address,address);
+    
+    //wait a client
+    PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_WIFI_CONNECT_IND));
+    //start dns server
+    Pt_AppDnsd = rtx_AppDnsServer(&PtList);
+
+    PT_END(Pt);
+}
+
+static PT_THREAD(demo_spi(struct pt *Pt, const RosMailType *Mail)) {
+    static struct pt childPt;
+    PT_BEGIN(Pt);
+    
+    //PT_YIELD_UNTIL(Pt, IS_RECEIVED(KEY_MESSAGE));
+    
+        const rsuint32 baud_rate = 32000000;
+        
+        printf("Arrancando PtDrvSpiSlaveInit\n");
+        PT_SPAWN(Pt, &childPt, PtDrvSpiSlaveInit(&childPt, Mail, baud_rate));
+        
+        printf("Arrancando DrvSpiSlaveInit\n");
+        DrvSpiSlaveInit(baud_rate);
+  
+        while (1) {
+            //PT_YIELD_UNTIL(Pt, IS_RECEIVED(SPI_SLAVE_RX_DATA));
+            //PT_YIELD_UNTIL(Pt, IS_RECEIVED(KEY_MESSAGE));
+            RosTimerStart(APP_PACKET_DELAY_TIMER, (3000 * RS_T1MS), &PacketDelayTimer);PT_YIELD_UNTIL(Pt, IS_RECEIVED(APP_PACKET_DELAY_TIMEOUT));  
+            
+            //rsuint8 recibidospi[DrvSpiSlaveRxGetSize()];
+            static rsuint8 enviadospi[5];
+            
+            //DrvSpiSlaveRx(&recibidospi[0], sizeof(recibidospi));
+            
+            enviadospi[0] = 111;
+            enviadospi[1] = 212;
+            //enviadospi[1] = recibidospi[0];
+            //enviadospi[2] = recibidospi[1];
+            
+            //DrvSpiSlaveRxFlush();
+            
+            //DrvSpiSlaveTxStart(&enviadospi[0], 2);
+            printf("ENVIADO\n");
+            
+        }
+    PT_END(Pt);
+}
+
+
 /**
  * @brief Test procedure which can be called from the debug terminal
  * @param Pt : current protothread pointer
@@ -1018,6 +1116,23 @@ static PT_THREAD(PtTest(struct pt *Pt, const RosMailType *Mail)) {
   #endif
 
   PT_END(Pt);
+}
+
+/**
+ * @brief Main protothread. It controls the SPI or the debug terminal
+ * @param Pt : current protothread pointer
+ * @param Mail : protothread mail
+ **/
+static PT_THREAD(demo_wifi(struct pt *Pt, const RosMailType *Mail)) {
+    static struct pt childPt;
+    
+    PT_BEGIN(Pt);
+        //Start softap (ap+dns)
+        PT_SPAWN(Pt, &childPt, PtWifi_softAP(&childPt, Mail));
+        
+        //Start webserver
+        //Pt_AppWebd = rtx_AppWebServer(&PtList);
+    PT_END(Pt);
 }
 
 /**
@@ -1163,6 +1278,15 @@ static PT_THREAD(PtMain(struct pt *Pt, const RosMailType *Mail)) {
       }
       else if (strcmp(argv[0], "resume") == 0) {
         PT_SPAWN(Pt, &childPt, PtWifi_resume(&childPt, Mail));
+      }
+      else if (strcmp(argv[0], "softap") == 0) {
+        PT_SPAWN(Pt, &childPt, PtWifi_softAP(&childPt, Mail));
+      }
+      //else if (strcmp(argv[0], "webserver") == 0) {
+        //Pt_AppWebd = rtx_AppWebServer(&PtList);
+      //}
+      else if (strcmp(argv[0], "spimode") == 0) {
+        PT_SPAWN(Pt, &childPt, demo_spi(&childPt, Mail));
       }
       else
       {
@@ -1348,6 +1472,14 @@ static PT_THREAD(PtMain(struct pt *Pt, const RosMailType *Mail)) {
         PT_SPAWN(Pt, &childPt, PtWifi_resume(&childPt, Mail));
         break;
       }
+      case 16: { //WiFi mode SoftAP
+        PT_SPAWN(Pt, &childPt, PtWifi_softAP(&childPt, Mail));
+        break;
+      }
+      //case 17: { //Start webserver
+        //Pt_AppWebd = rtx_AppWebServer(&PtList);
+        //break;
+      //}
 
     }
 
@@ -1381,7 +1513,9 @@ void ColaTask(const RosMailType *Mail) {
       AppWifiInit(&PtList);
 
       // Start the Main protothread
-      PtStart(&PtList, PtMain, NULL, NULL);
+      //PtStart(&PtList, PtMain, NULL, NULL);
+      PtStart(&PtList, demo_wifi, NULL, NULL);
+      //PtStart(&PtList, demo_spi, NULL, NULL);
       break;
 
     case TERMINATETASK:
@@ -1395,7 +1529,7 @@ void ColaTask(const RosMailType *Mail) {
       if (((ApiSocketSendCfmType *)Mail)->Status == RSS_SUCCESS)
         PRINTLN("Send OK");
       else
-        PRINTLN("Send ERROR");
+      PRINTLN("Send ERROR");
       #endif
       break;
 
